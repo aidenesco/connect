@@ -1,1 +1,1 @@
-module "proxypool"
+module "github.com/aidenesco/proxypool"
