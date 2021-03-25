@@ -1,5 +1,5 @@
-# Proxypool [![GoDoc](https://godoc.org/github.com/aidenesco/proxypool?status.svg)](https://godoc.org/github.com/aidenesco/proxypool) [![Go Report Card](https://goreportcard.com/badge/github.com/aidenesco/proxypool)](https://goreportcard.com/report/github.com/aidenesco/proxypool)
-This package distributes either incoming or outgoing requests through a pool of proxies. Proxy rotation spreads out usage as much as possible to avoid IP bans or restrictions. This package also acts as a proxy gateway, accepting CONNECT requests and forwarding them on.
+# proxypool [![GoDoc](https://godoc.org/github.com/aidenesco/proxypool?status.svg)](https://godoc.org/github.com/aidenesco/proxypool) [![Go Report Card](https://goreportcard.com/badge/github.com/aidenesco/proxypool)](https://goreportcard.com/report/github.com/aidenesco/proxypool)
+This package distributes either incoming or outgoing requests through a pool of proxies. Proxy rotation spreads out usage as much as possible to avoid IP bans or restrictions. This package can also act as a proxy gateway, accepting CONNECT requests and forwarding them on.
 
 
 ## Installation
