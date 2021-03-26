@@ -1,4 +1,3 @@
-//Package proxypool provides programmatic access to a pool of proxies
 package proxypool
 
 import (
