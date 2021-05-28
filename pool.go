@@ -8,109 +8,117 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"sync"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
+
+//ProxyOption is an option that modifies a Proxy
+type ProxyOption func(*proxy)
+
+//WithBetweenUse sets a duration for a proxy to wait before it's used again on the same host
+func WithBetweenUse(dur time.Duration) ProxyOption {
+	return func(proxy *proxy) {
+		proxy.betweenUse = dur
+	}
+}
 
 //Pool holds a ring of proxies used to distribute requests
 type Pool struct {
-	amu     sync.Mutex
-	pool    *ring.Ring
+	sem     *semaphore.Weighted
+	ring    *ring.Ring
 	perHost map[string]*ring.Ring
 }
 
-//NewPool returns a new, empty pool
+//NewPool returns a new, empty ring
 func NewPool() *Pool {
-	return &Pool{perHost: make(map[string]*ring.Ring)}
+	return &Pool{
+		perHost: make(map[string]*ring.Ring),
+		sem:     semaphore.NewWeighted(1),
+	}
 }
 
-func (p *Pool) addProxy(proxy *proxy) error {
+func (p *Pool) addProxy(ctx context.Context, proxy *proxy) error {
 	newRing := ring.New(1)
 	newRing.Value = proxy
 
-	p.amu.Lock()
-	defer p.amu.Unlock()
+	p.sem.Acquire(ctx, 1)
 
-	if p.pool == nil {
-		p.pool = newRing
+	if p.ring == nil {
+		p.ring = newRing
 	} else {
-		p.pool = p.pool.Link(newRing)
+		p.ring = p.ring.Link(newRing)
 	}
+
+	p.sem.Release(1)
+
 	return nil
 }
 
-//AddProxy adds a proxy to the pool, with options applied
-func (p *Pool) AddProxy(proxyUrl string, options ...ProxyOption) error {
-	parsedUrl, err := url.Parse(proxyUrl)
-	if err != nil {
-		return err
-	}
-
-	if !checkValidScheme(parsedUrl) {
+//AddProxy adds a proxy to the ring, with options applied
+func (p *Pool) AddProxy(url *url.URL, options ...ProxyOption) error {
+	if !checkValidScheme(url) {
 		return errors.New("proxypool: invalid proxy url scheme, must be one of [\"http\", \"https\", \"socks5\"]")
 	}
 
 	proxy := &proxy{
-		url:        parsedUrl,
-		betweenUse: 0,
-		times:      make(map[string]time.Time),
+		url:            url,
+		betweenUse:     0,
+		lastUsePerHost: make(map[string]time.Time),
 	}
 
 	for _, v := range options {
 		v(proxy)
 	}
 
-	return p.addProxy(proxy)
+	return p.addProxy(context.Background(), proxy)
 }
 
-func (p *Pool) getConn(ctx context.Context, r *http.Request) (net.Conn, error) {
-	p.amu.Lock()
-	startAt, ok := p.perHost[r.URL.Host]
+func (p *Pool) getNextProxy(r *http.Request) (*proxy, error) {
+	err := p.sem.Acquire(r.Context(), 1)
+	if err != nil {
+		return nil, err
+	}
+
+	current, ok := p.perHost[r.Host]
 	if !ok {
-		startAt = p.pool
-		p.perHost[r.URL.Host] = startAt
+		current = p.ring
+		p.perHost[r.Host] = current
 	} else {
-		p.perHost[r.URL.Host] = startAt.Next()
+		p.perHost[r.Host] = current.Next()
 	}
-	p.amu.Unlock()
 
-	connChan := make(chan net.Conn, 1)
+	p.sem.Release(1)
 
-	go func() {
-		current := startAt.Prev()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				current = current.Next()
-				p, ok := current.Value.(*proxy)
-				if !ok {
-					return
-				}
+	proxy, ok := current.Value.(*proxy)
+	if !ok {
+		return nil, errors.New("bad type")
+	}
 
-				if !p.canServe(r) {
-					continue
-				}
+	if !proxy.canServe(r) {
+		return nil, errors.New("unable to serve this request")
+	}
+	return proxy, nil
+}
 
-				conn, err := p.dial(r.URL.String())
-				if err != nil {
-					continue
-				}
-
-				connChan <- conn
-				return
+func (p *Pool) getConn(r *http.Request) (net.Conn, error) {
+	for {
+		select {
+		case <-r.Context().Done():
+			return nil, errors.New("proxypool: context done before establishing connection")
+		default:
+			proxy, err := p.getNextProxy(r)
+			if err != nil {
+				continue
 			}
+
+			conn, err := proxy.dial(r)
+			if err != nil {
+				continue
+			}
+			return conn, err
 		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil, errors.New("proxypool: context done before establishing connection")
-	case conn := <-connChan:
-		return conn, nil
 	}
-
 }
 
 //Serve is an http handler to serve as a gateway proxy. Only accepts CONNECT requests
@@ -120,7 +128,7 @@ func (p *Pool) Serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pConn, err := p.getConn(r.Context(), r)
+	pConn, err := p.getConn(r)
 	if err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -155,36 +163,16 @@ func (p *Pool) Serve(w http.ResponseWriter, r *http.Request) {
 
 //Proxy is a function to use as http.Transport.Proxy
 func (p *Pool) Proxy(r *http.Request) (*url.URL, error) {
-	p.amu.Lock()
-	startAt, ok := p.perHost[r.URL.Host]
-	if !ok {
-		startAt = p.pool
-		p.perHost[r.URL.Host] = startAt
-	} else {
-		p.perHost[r.URL.Host] = startAt.Next()
-	}
-	p.amu.Unlock()
-
-	current := startAt.Prev()
-
 	for {
 		select {
 		case <-r.Context().Done():
 			return nil, errors.New("proxypool: context done before proxy was found")
 		default:
-			current = current.Next()
-			p, ok := current.Value.(*proxy)
-			if !ok {
-				return nil, errors.New("proxypool: invalid proxy cast")
-			}
-
-			if !p.canServe(r) {
+			proxy, err := p.getNextProxy(r)
+			if err != nil {
 				continue
 			}
-
-			return p.url, nil
+			return proxy.url, nil
 		}
-
 	}
-
 }

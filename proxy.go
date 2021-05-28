@@ -7,57 +7,52 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"sync"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
-//ProxyOption is an option that modifies a Proxy
-type ProxyOption func(*proxy)
-
-//WithBetweenUse sets a duration for a proxy to wait before it's used again on the same host
-func WithBetweenUse(dur time.Duration) ProxyOption {
-	return func(proxy *proxy) {
-		proxy.betweenUse = dur
-	}
-}
-
 type proxy struct {
-	mu         sync.Mutex
-	url        *url.URL
-	betweenUse time.Duration
-	times      map[string]time.Time
-}
-
-func (p *proxy) checkTime(host string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	now := time.Now()
-	previous, ok := p.times[host]
-	if ok && previous.Sub(now) <= p.betweenUse {
-		return false
-	}
-
-	p.times[host] = now
-	return true
+	sem            semaphore.Weighted
+	url            *url.URL
+	betweenUse     time.Duration
+	lastUsePerHost map[string]time.Time
 }
 
 func (p *proxy) canServe(r *http.Request) bool {
-	return p.checkTime(r.Host)
+	err := p.sem.Acquire(r.Context(), 1)
+	if err != nil {
+		return false
+	}
+
+	prev, ok := p.lastUsePerHost[r.Host]
+	if ok && time.Until(prev) <= p.betweenUse {
+		return false
+	}
+
+	p.lastUsePerHost[r.Host] = time.Now()
+
+	p.sem.Release(1)
+	return true
 }
 
-func (p *proxy) dial(address string) (conn net.Conn, err error) {
+func (p *proxy) dial(r *http.Request) (conn net.Conn, err error) {
 	defer func() {
 		if err != nil {
 			_ = conn.Close()
 		}
 	}()
 
-	conn, err = tls.Dial("tcp", p.url.String(), nil)
+	var d net.Dialer
+
+	conn, err = d.DialContext(r.Context(), "tcp", p.url.String())
 	if err != nil {
 		return nil, fmt.Errorf("proxypool: error dialing the proxy '%v'", err)
 	}
 
-	connect, err := http.NewRequest("CONNECT", address, nil)
+	conn = tls.Client(conn, nil)
+
+	connect, err := http.NewRequestWithContext(r.Context(), http.MethodConnect, r.URL.String(), nil)
 	if err != nil {
 		err = fmt.Errorf("proxypool: error creating the CONNECT request '%v'", err)
 		return
@@ -83,7 +78,6 @@ func (p *proxy) dial(address string) (conn net.Conn, err error) {
 	}
 
 	if response.StatusCode != http.StatusOK {
-		_ = conn.Close()
 		if response.StatusCode == http.StatusProxyAuthRequired {
 			err = fmt.Errorf("proxypool: invalid or missing Proxy-Authentication header")
 			return
