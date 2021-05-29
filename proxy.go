@@ -3,6 +3,8 @@ package proxypool
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -25,9 +27,12 @@ func (p *proxy) canServe(r *http.Request) bool {
 		return false
 	}
 
-	prev, ok := p.lastUsePerHost[r.Host]
-	if ok && time.Until(prev) <= p.betweenUse {
-		return false
+	if p.betweenUse != 0 {
+		prev, ok := p.lastUsePerHost[r.Host]
+		if ok && time.Since(prev) <= p.betweenUse {
+			p.sem.Release(1)
+			return false
+		}
 	}
 
 	p.lastUsePerHost[r.Host] = time.Now()
@@ -39,51 +44,59 @@ func (p *proxy) canServe(r *http.Request) bool {
 func (p *proxy) dial(r *http.Request) (conn net.Conn, err error) {
 	defer func() {
 		if err != nil {
-			_ = conn.Close()
+			conn.Close()
 		}
 	}()
 
-	var d net.Dialer
-
-	conn, err = d.DialContext(r.Context(), "tcp", p.url.String())
+	conn, err = sharedDialer.DialContext(r.Context(), "tcp", p.url.Host)
 	if err != nil {
-		return nil, fmt.Errorf("proxypool: error dialing the proxy '%v'", err)
+		return
 	}
 
-	conn = tls.Client(conn, nil)
+	tconn := tls.Client(conn, &tls.Config{
+		ServerName: r.Host,
+	})
 
-	connect, err := http.NewRequestWithContext(r.Context(), http.MethodConnect, r.URL.String(), nil)
+	err = tconn.Handshake()
 	if err != nil {
-		err = fmt.Errorf("proxypool: error creating the CONNECT request '%v'", err)
+		return
+	}
+
+	conn = tconn
+
+	var connect *http.Request
+	connect, err = http.NewRequest(http.MethodConnect, r.Host, nil)
+	if err != nil {
 		return
 	}
 
 	if u := p.url.User; u != nil {
 		username := u.Username()
 		password, _ := u.Password()
-		connect.Header.Set("Proxy-Authorization", "Basic "+basicAuth(username, password))
+		connect.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(username+":"+password)))
 	}
 
-	if err = connect.Write(conn); err != nil {
-		err = fmt.Errorf("proxypool: error sending CONNECT request to proxy '%v'", err)
+	err = connect.Write(conn)
+	if err != nil {
 		return
 	}
 
 	bufr := bufio.NewReader(conn)
 
-	response, err := http.ReadResponse(bufr, connect)
+	var response *http.Response
+	response, err = http.ReadResponse(bufr, connect)
 	if err != nil {
-		err = fmt.Errorf("proxypool: error reading server response to CONNECT request '%v'", err)
 		return
 	}
 
-	if response.StatusCode != http.StatusOK {
-		if response.StatusCode == http.StatusProxyAuthRequired {
-			err = fmt.Errorf("proxypool: invalid or missing Proxy-Authentication header")
-			return
-		}
-		err = fmt.Errorf("proxypool: unexpected CONNECT response status '%v' (expect 200 OK)", response.Status)
+	switch response.StatusCode {
+	case http.StatusOK:
+		return
+	case http.StatusProxyAuthRequired:
+		err = errors.New("invalid or missing \"Proxy-Authorization\" header")
+		return
+	default:
+		err = fmt.Errorf("unexpected CONNECT response status \"%v\" (expect 200 OK)", response.Status)
 		return
 	}
-	return
 }

@@ -4,7 +4,6 @@ import (
 	"container/ring"
 	"context"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,12 +13,13 @@ import (
 )
 
 //ProxyOption is an option that modifies a Proxy
-type ProxyOption func(*proxy)
+type ProxyOption func(*proxy) error
 
 //WithBetweenUse sets a duration for a proxy to wait before it's used again on the same host
 func WithBetweenUse(dur time.Duration) ProxyOption {
-	return func(proxy *proxy) {
+	return func(proxy *proxy) error {
 		proxy.betweenUse = dur
+		return nil
 	}
 }
 
@@ -30,7 +30,7 @@ type Pool struct {
 	perHost map[string]*ring.Ring
 }
 
-//NewPool returns a new, empty ring
+//NewPool returns a new, empty pool
 func NewPool() *Pool {
 	return &Pool{
 		perHost: make(map[string]*ring.Ring),
@@ -56,28 +56,32 @@ func (p *Pool) addProxy(ctx context.Context, proxy *proxy) error {
 }
 
 //AddProxy adds a proxy to the ring, with options applied
-func (p *Pool) AddProxy(url *url.URL, options ...ProxyOption) error {
-	if !checkValidScheme(url) {
-		return errors.New("proxypool: invalid proxy url scheme, must be one of [\"http\", \"https\", \"socks5\"]")
+func (p *Pool) AddProxy(url *url.URL, options ...ProxyOption) (err error) {
+	if url.Scheme != "https" {
+		err = errors.New("proxy: invalid proxy url scheme")
+		return
 	}
 
 	proxy := &proxy{
 		url:            url,
-		betweenUse:     0,
 		lastUsePerHost: make(map[string]time.Time),
 	}
 
 	for _, v := range options {
-		v(proxy)
+		err = v(proxy)
+		if err != nil {
+			return
+		}
 	}
 
-	return p.addProxy(context.Background(), proxy)
+	err = p.addProxy(context.Background(), proxy)
+	return
 }
 
-func (p *Pool) getNextProxy(r *http.Request) (*proxy, error) {
-	err := p.sem.Acquire(r.Context(), 1)
+func (p *Pool) getNextProxy(r *http.Request) (prox *proxy, err error) {
+	err = p.sem.Acquire(r.Context(), 1)
 	if err != nil {
-		return nil, err
+		return
 	}
 
 	current, ok := p.perHost[r.Host]
@@ -90,33 +94,51 @@ func (p *Pool) getNextProxy(r *http.Request) (*proxy, error) {
 
 	p.sem.Release(1)
 
-	proxy, ok := current.Value.(*proxy)
+	prox, ok = current.Value.(*proxy)
 	if !ok {
-		return nil, errors.New("bad type")
+		err = errors.New("bad type")
 	}
 
-	if !proxy.canServe(r) {
+	if !prox.canServe(r) {
 		return nil, errors.New("unable to serve this request")
 	}
-	return proxy, nil
+	return
 }
 
-func (p *Pool) getConn(r *http.Request) (net.Conn, error) {
+func (p *Pool) getConn(r *http.Request) (conn net.Conn, err error) {
+	c := make(chan net.Conn, 1)
+	ctx := r.Context()
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				//management in here
+				proxy, err := p.getNextProxy(r)
+				if err != nil {
+					continue
+				}
+
+				conn, err := proxy.dial(r)
+				if err != nil {
+					continue
+				}
+
+				c <- conn
+				return
+			}
+		}
+	}()
+
 	for {
 		select {
-		case <-r.Context().Done():
-			return nil, errors.New("proxypool: context done before establishing connection")
-		default:
-			proxy, err := p.getNextProxy(r)
-			if err != nil {
-				continue
-			}
-
-			conn, err := proxy.dial(r)
-			if err != nil {
-				continue
-			}
-			return conn, err
+		case <-ctx.Done():
+			err = ctx.Err()
+			return
+		case conn = <-c:
+			return
 		}
 	}
 }
@@ -148,31 +170,6 @@ func (p *Pool) Serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go func(destination io.WriteCloser, source io.ReadCloser) {
-		defer destination.Close()
-		defer source.Close()
-
-		_, _ = io.Copy(destination, source)
-	}(pConn, cConn)
-	go func(destination io.WriteCloser, source io.ReadCloser) {
-		defer destination.Close()
-		defer source.Close()
-		_, _ = io.Copy(destination, source)
-	}(cConn, pConn)
-}
-
-//Proxy is a function to use as http.Transport.Proxy
-func (p *Pool) Proxy(r *http.Request) (*url.URL, error) {
-	for {
-		select {
-		case <-r.Context().Done():
-			return nil, errors.New("proxypool: context done before proxy was found")
-		default:
-			proxy, err := p.getNextProxy(r)
-			if err != nil {
-				continue
-			}
-			return proxy.url, nil
-		}
-	}
+	go transfer(pConn, cConn)
+	go transfer(cConn, pConn)
 }

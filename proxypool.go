@@ -1,20 +1,14 @@
 package proxypool
 
 import (
-	"encoding/base64"
-	"net/url"
+	"io"
+	"net"
 )
 
-func basicAuth(username, password string) string {
-	auth := username + ":" + password
-	return base64.StdEncoding.EncodeToString([]byte(auth))
-}
+var sharedDialer net.Dialer
 
-func checkValidScheme(proxyUrl *url.URL) bool {
-	switch proxyUrl.Scheme {
-	case "http", "https", "socks5":
-		return true
-	default:
-		return false
-	}
+func transfer(destination io.WriteCloser, source io.ReadCloser) {
+	defer destination.Close()
+	defer source.Close()
+	_, _ = io.Copy(destination, source)
 }
