@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"time"
@@ -41,28 +40,17 @@ func (p *proxy) canServe(r *http.Request) bool {
 	return true
 }
 
-func (p *proxy) dial(r *http.Request) (conn net.Conn, err error) {
+func (p *proxy) dial(r *http.Request) (conn *tls.Conn, err error) {
 	defer func() {
 		if err != nil {
 			conn.Close()
 		}
 	}()
 
-	conn, err = sharedDialer.DialContext(r.Context(), "tcp", p.url.Host)
+	conn, err = tls.DialWithDialer(&sharedDialer, "tcp", p.url.Host, nil)
 	if err != nil {
 		return
 	}
-
-	tconn := tls.Client(conn, &tls.Config{
-		ServerName: r.Host,
-	})
-
-	err = tconn.Handshake()
-	if err != nil {
-		return
-	}
-
-	conn = tconn
 
 	var connect *http.Request
 	connect, err = http.NewRequest(http.MethodConnect, r.Host, nil)
