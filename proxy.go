@@ -53,7 +53,7 @@ func (p *proxy) dial(r *http.Request) (conn *tls.Conn, err error) {
 	}
 
 	var connect *http.Request
-	connect, err = http.NewRequest(http.MethodConnect, r.Host, nil)
+	connect, err = http.NewRequest(http.MethodConnect, r.URL.Host, nil)
 	if err != nil {
 		return
 	}
