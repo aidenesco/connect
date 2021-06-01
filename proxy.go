@@ -47,7 +47,7 @@ func (p *proxy) dial(r *http.Request) (conn *tls.Conn, err error) {
 		}
 	}()
 
-	conn, err = tls.DialWithDialer(&sharedDialer, "tcp", p.url.Host, nil)
+	conn, err = tls.Dial("tcp", p.url.Host, nil)
 	if err != nil {
 		return
 	}

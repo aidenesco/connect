@@ -115,7 +115,6 @@ func (p *Pool) getConn(r *http.Request) (conn net.Conn, err error) {
 			case <-ctx.Done():
 				return
 			default:
-				//management in here
 				proxy, err := p.getNextProxy(r)
 				if err != nil {
 					continue
