@@ -47,13 +47,13 @@ func (p *proxy) dial(r *http.Request) (conn *tls.Conn, err error) {
 		}
 	}()
 
-	conn, err = tls.Dial("tcp", p.url.Host, nil)
+	conn, err = tls.Dial("tcp", p.url.String(), nil)
 	if err != nil {
 		return
 	}
 
 	var connect *http.Request
-	connect, err = http.NewRequest(http.MethodConnect, r.URL.Host, nil)
+	connect, err = http.NewRequest(http.MethodConnect, r.URL.String(), nil)
 	if err != nil {
 		return
 	}
