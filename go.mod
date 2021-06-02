@@ -1,4 +1,4 @@
-module github.com/aidenesco/proxypool
+module github.com/aidenesco/connect
 
 go 1.14
 

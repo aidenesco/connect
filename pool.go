@@ -1,4 +1,4 @@
-package proxypool
+package connect
 
 import (
 	"container/ring"
@@ -12,12 +12,12 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-//ProxyOption is an option that modifies a Proxy
-type ProxyOption func(*proxy) error
+//ProxyOption is an option that modifies a proxyContainer
+type ProxyOption func(*proxyContainer) error
 
 //WithBetweenUse sets a duration for a proxy to wait before it's used again on the same host
 func WithBetweenUse(dur time.Duration) ProxyOption {
-	return func(proxy *proxy) error {
+	return func(proxy *proxyContainer) error {
 		proxy.betweenUse = dur
 		return nil
 	}
@@ -38,11 +38,11 @@ func NewPool() *Pool {
 	}
 }
 
-func (p *Pool) addProxy(ctx context.Context, proxy *proxy) error {
+func (p *Pool) addProxy(proxyC *proxyContainer) error {
 	newRing := ring.New(1)
-	newRing.Value = proxy
+	newRing.Value = proxyC
 
-	p.sem.Acquire(ctx, 1)
+	p.sem.Acquire(context.Background(), 1)
 
 	if p.ring == nil {
 		p.ring = newRing
@@ -55,30 +55,31 @@ func (p *Pool) addProxy(ctx context.Context, proxy *proxy) error {
 	return nil
 }
 
-//AddProxy adds a proxy to the ring, with options applied
-func (p *Pool) AddProxy(url *url.URL, options ...ProxyOption) (err error) {
-	if url.Scheme != "https" {
-		err = errors.New("proxy: invalid proxy url scheme")
+//AddProxy adds a Proxy to the ring, with options applied
+func (p *Pool) AddProxy(proxy *Proxy, options ...ProxyOption) (err error) {
+	if proxy.URL.Scheme != "https" {
+		err = errors.New("connect: invalid proxy url scheme")
 		return
 	}
 
-	proxy := &proxy{
-		url:            url,
+	proxyC := &proxyContainer{
+		proxy:          proxy,
 		lastUsePerHost: make(map[string]time.Time),
+		sem:            semaphore.NewWeighted(1),
 	}
 
-	for _, v := range options {
-		err = v(proxy)
+	for _, o := range options {
+		err = o(proxyC)
 		if err != nil {
 			return
 		}
 	}
 
-	err = p.addProxy(context.Background(), proxy)
+	err = p.addProxy(proxyC)
 	return
 }
 
-func (p *Pool) getNextProxy(r *http.Request) (prox *proxy, err error) {
+func (p *Pool) getNextProxy(r *http.Request) (proxyC *proxyContainer, err error) {
 	err = p.sem.Acquire(r.Context(), 1)
 	if err != nil {
 		return
@@ -94,13 +95,15 @@ func (p *Pool) getNextProxy(r *http.Request) (prox *proxy, err error) {
 
 	p.sem.Release(1)
 
-	prox, ok = current.Value.(*proxy)
+	proxyC, ok = current.Value.(*proxyContainer)
 	if !ok {
 		err = errors.New("bad type")
+		return
 	}
 
-	if !prox.canServe(r) {
-		return nil, errors.New("unable to serve this request")
+	if !proxyC.canServe(r) {
+		err = errors.New("unable to serve this request")
+		return
 	}
 	return
 }
@@ -111,34 +114,36 @@ func (p *Pool) getConn(r *http.Request) (conn net.Conn, err error) {
 
 	go func() {
 		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				proxy, err := p.getNextProxy(r)
-				if err != nil {
-					continue
-				}
-
-				conn, err := proxy.dial(r)
-				if err != nil {
-					continue
-				}
-
-				c <- conn
+			if ctx.Err() != nil {
 				return
 			}
+
+			proxyC, err := p.getNextProxy(r)
+			if err != nil {
+				continue
+			}
+
+			cURL, err := url.Parse(r.URL.String())
+			if err != nil {
+				continue
+			}
+
+			conn, err := proxyC.proxy.Connection(cURL)
+			if err != nil {
+				continue
+			}
+
+			c <- conn
+			break
 		}
 	}()
 
-	for {
-		select {
-		case <-ctx.Done():
-			err = ctx.Err()
-			return
-		case conn = <-c:
-			return
-		}
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+		return
+	case conn = <-c:
+		return
 	}
 }
 

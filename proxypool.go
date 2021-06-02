@@ -1,4 +1,4 @@
-package proxypool
+package connect
 
 import (
 	"io"
