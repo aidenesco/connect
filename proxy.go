@@ -17,16 +17,23 @@ type Proxy struct {
 	URL *url.URL
 }
 
-func (p *Proxy) Connection(to *url.URL) (conn *tls.Conn, err error) {
-	conn, err = tls.Dial("tcp", p.URL.String(), nil)
+func (p *Proxy) Connection(to *url.URL) (originConn *tls.Conn, err error) {
+	var proxyConn *tls.Conn
+	proxyConn, err = tls.Dial("tcp", p.URL.Host, nil)
 	if err != nil {
 		return
 	}
 
-	var connect *http.Request
-	connect, err = http.NewRequest(http.MethodConnect, to.String(), nil)
+	err = proxyConn.Handshake()
 	if err != nil {
 		return
+	}
+
+	connect := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: to.Host},
+		Host:   to.Host,
+		Header: make(http.Header),
 	}
 
 	if u := p.URL.User; u != nil {
@@ -35,12 +42,12 @@ func (p *Proxy) Connection(to *url.URL) (conn *tls.Conn, err error) {
 		connect.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(username+":"+password)))
 	}
 
-	err = connect.Write(conn)
+	err = connect.Write(proxyConn)
 	if err != nil {
 		return
 	}
 
-	bufr := bufio.NewReader(conn)
+	bufr := bufio.NewReader(proxyConn)
 
 	var response *http.Response
 	response, err = http.ReadResponse(bufr, connect)

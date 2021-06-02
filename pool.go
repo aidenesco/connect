@@ -175,5 +175,5 @@ func (p *Pool) Serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go transfer(pConn, cConn)
-	transfer(cConn, pConn)
+	go transfer(cConn, pConn)
 }
