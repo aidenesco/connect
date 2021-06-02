@@ -18,13 +18,13 @@ type Proxy struct {
 }
 
 func (p *Proxy) Connection(to *url.URL) (conn *tls.Conn, err error) {
-	conn, err = tls.Dial("tcp", p.URL.Host, nil)
+	conn, err = tls.Dial("tcp", p.URL.String(), nil)
 	if err != nil {
 		return
 	}
 
 	var connect *http.Request
-	connect, err = http.NewRequest(http.MethodConnect, to.Host, nil)
+	connect, err = http.NewRequest(http.MethodConnect, to.String(), nil)
 	if err != nil {
 		return
 	}
