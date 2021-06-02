@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"net/url"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -123,12 +122,7 @@ func (p *Pool) getConn(r *http.Request) (conn net.Conn, err error) {
 				continue
 			}
 
-			cURL, err := url.Parse(r.URL.String())
-			if err != nil {
-				continue
-			}
-
-			conn, err := proxyC.proxy.Connection(cURL)
+			conn, err := proxyC.proxy.Connection(r.URL)
 			if err != nil {
 				continue
 			}
