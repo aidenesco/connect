@@ -11,6 +11,33 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
+type proxyContainer struct {
+	sem            *semaphore.Weighted
+	proxy          *Proxy
+	betweenUse     time.Duration
+	lastUsePerHost map[string]time.Time
+}
+
+func (p *proxyContainer) canServe(r *http.Request) bool {
+	err := p.sem.Acquire(r.Context(), 1)
+	if err != nil {
+		return false
+	}
+
+	if p.betweenUse != 0 {
+		prev, ok := p.lastUsePerHost[r.Host]
+		if ok && time.Since(prev) <= p.betweenUse {
+			p.sem.Release(1)
+			return false
+		}
+	}
+
+	p.lastUsePerHost[r.Host] = time.Now()
+
+	p.sem.Release(1)
+	return true
+}
+
 //ProxyOption is an option that modifies a proxyContainer
 type ProxyOption func(*proxyContainer) error
 
@@ -56,11 +83,6 @@ func (p *Pool) addProxy(proxyC *proxyContainer) error {
 
 //AddProxy adds a Proxy to the ring, with options applied
 func (p *Pool) AddProxy(proxy *Proxy, options ...ProxyOption) (err error) {
-	if proxy.URL.Scheme != "https" {
-		err = errors.New("connect: invalid proxy url scheme")
-		return
-	}
-
 	proxyC := &proxyContainer{
 		proxy:          proxy,
 		lastUsePerHost: make(map[string]time.Time),

@@ -6,138 +6,82 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
-	"time"
 
-	"golang.org/x/sync/semaphore"
+	"github.com/thinkgos/go-socks5/ccsocks5"
 )
 
 type Proxy struct {
 	URL *url.URL
 }
 
-func (p *Proxy) Connection(to *url.URL) (conn *tls.Conn, err error) {
-	conn, err = tls.Dial("tcp", p.URL.Host, nil)
-	if err != nil {
-		return
-	}
+func (p *Proxy) Connection(to *url.URL) (conn net.Conn, err error) {
+	switch to.Scheme {
+	case "https":
+		var tConn *tls.Conn
+		tConn, err = tls.Dial("tcp", p.URL.Host, nil)
 
-	err = conn.Handshake()
-	if err != nil {
-		return
-	}
+		if err != nil {
+			return
+		}
+		defer func() {
+			if err != nil {
+				tConn.Close()
+			}
+		}()
 
-	connect := &http.Request{
-		Method: http.MethodConnect,
-		URL:    &url.URL{Opaque: to.Host},
-		Host:   to.Host,
-		Header: make(http.Header),
-	}
+		err = tConn.Handshake()
+		if err != nil {
+			return
+		}
 
-	if u := p.URL.User; u != nil {
-		username := u.Username()
-		password, _ := u.Password()
-		connect.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(username+":"+password)))
-	}
+		connect := &http.Request{
+			Method: http.MethodConnect,
+			URL:    &url.URL{Opaque: to.Host},
+			Host:   to.Host,
+			Header: make(http.Header),
+		}
 
-	err = connect.Write(conn)
-	if err != nil {
-		return
-	}
+		if u := p.URL.User; u != nil {
+			username := u.Username()
+			password, _ := u.Password()
+			connect.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(username+":"+password)))
+		}
 
-	bufr := bufio.NewReader(conn)
+		err = connect.Write(conn)
+		if err != nil {
+			return
+		}
 
-	var response *http.Response
-	response, err = http.ReadResponse(bufr, connect)
-	if err != nil {
-		return
-	}
+		bufr := bufio.NewReader(conn)
 
-	switch response.StatusCode {
-	case http.StatusOK:
-		return
-	case http.StatusProxyAuthRequired:
-		err = errors.New("invalid or missing \"Proxy-Authorization\" header")
+		var response *http.Response
+		response, err = http.ReadResponse(bufr, connect)
+		if err != nil {
+			return
+		}
+
+		switch response.StatusCode {
+		case http.StatusOK:
+			conn = tConn
+			return
+		case http.StatusProxyAuthRequired:
+			err = errors.New("connect: invalid or missing \"Proxy-Authorization\" header")
+			return
+		default:
+			err = fmt.Errorf("connect: unexpected CONNECT response status \"%s\" (expect 200 OK)", response.Status)
+			return
+		}
+	case "socks5":
+		c := ccsocks5.NewClient(p.URL.Host)
+
+		conn, err = c.Dial("tcp", to.Host)
 		return
 	default:
-		err = fmt.Errorf("unexpected CONNECT response status \"%v\" (expect 200 OK)", response.Status)
+		err = errors.New("connect: url scheme must be one of: [\"https\", \"socks5\"]")
 		return
 	}
+
 }
-
-type proxyContainer struct {
-	sem            *semaphore.Weighted
-	proxy          *Proxy
-	betweenUse     time.Duration
-	lastUsePerHost map[string]time.Time
-}
-
-func (p *proxyContainer) canServe(r *http.Request) bool {
-	err := p.sem.Acquire(r.Context(), 1)
-	if err != nil {
-		return false
-	}
-
-	if p.betweenUse != 0 {
-		prev, ok := p.lastUsePerHost[r.Host]
-		if ok && time.Since(prev) <= p.betweenUse {
-			p.sem.Release(1)
-			return false
-		}
-	}
-
-	p.lastUsePerHost[r.Host] = time.Now()
-
-	p.sem.Release(1)
-	return true
-}
-
-// func (p *proxyContainer) dial(r *http.Request) (conn *tls.Conn, err error) {
-// 	defer func() {
-// 		if err != nil {
-// 			conn.Close()
-// 		}
-// 	}()
-
-// 	conn, err = tls.Dial("tcp", p.url.String(), nil)
-// 	if err != nil {
-// 		return
-// 	}
-
-// 	var connect *http.Request
-// 	connect, err = http.NewRequest(http.MethodConnect, r.URL.String(), nil)
-// 	if err != nil {
-// 		return
-// 	}
-
-// 	if u := p.url.User; u != nil {
-// 		username := u.Username()
-// 		password, _ := u.Password()
-// 		connect.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(username+":"+password)))
-// 	}
-
-// 	err = connect.Write(conn)
-// 	if err != nil {
-// 		return
-// 	}
-
-// 	bufr := bufio.NewReader(conn)
-
-// 	var response *http.Response
-// 	response, err = http.ReadResponse(bufr, connect)
-// 	if err != nil {
-// 		return
-// 	}
-
-// 	switch response.StatusCode {
-// 	case http.StatusOK:
-// 		return
-// 	case http.StatusProxyAuthRequired:
-// 		err = errors.New("invalid or missing \"Proxy-Authorization\" header")
-// 		return
-// 	default:
-// 		err = fmt.Errorf("unexpected CONNECT response status \"%v\" (expect 200 OK)", response.Status)
-// 		return
-// 	}
-// }
