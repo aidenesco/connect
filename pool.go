@@ -4,8 +4,10 @@ import (
 	"container/ring"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -192,4 +194,13 @@ func (p *Pool) Serve(w http.ResponseWriter, r *http.Request) {
 
 	go transfer(pConn, cConn)
 	go transfer(cConn, pConn)
+}
+
+func (p *Pool) Proxy(r *http.Request) (*url.URL, error) {
+	pc, err := p.getNextProxy(r)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %v", err)
+	}
+
+	return pc.proxy.URL, nil
 }
