@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -13,39 +14,12 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-type proxyContainer struct {
-	sem            *semaphore.Weighted
-	proxy          *Proxy
-	betweenUse     time.Duration
-	lastUsePerHost map[string]time.Time
-}
-
-func (p *proxyContainer) canServe(r *http.Request) bool {
-	err := p.sem.Acquire(r.Context(), 1)
-	if err != nil {
-		return false
-	}
-
-	if p.betweenUse != 0 {
-		prev, ok := p.lastUsePerHost[r.Host]
-		if ok && time.Since(prev) <= p.betweenUse {
-			p.sem.Release(1)
-			return false
-		}
-	}
-
-	p.lastUsePerHost[r.Host] = time.Now()
-
-	p.sem.Release(1)
-	return true
-}
-
 //ProxyOption is an option that modifies a proxyContainer
-type ProxyOption func(*proxyContainer) error
+type ProxyOption func(*Proxy) error
 
 //WithBetweenUse sets a duration for a proxy to wait before it's used again on the same host
 func WithBetweenUse(dur time.Duration) ProxyOption {
-	return func(proxy *proxyContainer) error {
+	return func(proxy *Proxy) error {
 		proxy.betweenUse = dur
 		return nil
 	}
@@ -66,43 +40,22 @@ func NewPool() *Pool {
 	}
 }
 
-func (p *Pool) addProxy(proxyC *proxyContainer) error {
+//AddProxy adds a Proxy to the pool
+func (p *Pool) AddProxy(proxy *Proxy) {
 	newRing := ring.New(1)
-	newRing.Value = proxyC
+	newRing.Value = proxy
 
 	p.sem.Acquire(context.Background(), 1)
+	defer p.sem.Release(1)
 
 	if p.ring == nil {
 		p.ring = newRing
 	} else {
 		p.ring = p.ring.Link(newRing)
 	}
-
-	p.sem.Release(1)
-
-	return nil
 }
 
-//AddProxy adds a Proxy to the ring, with options applied
-func (p *Pool) AddProxy(proxy *Proxy, options ...ProxyOption) (err error) {
-	proxyC := &proxyContainer{
-		proxy:          proxy,
-		lastUsePerHost: make(map[string]time.Time),
-		sem:            semaphore.NewWeighted(1),
-	}
-
-	for _, o := range options {
-		err = o(proxyC)
-		if err != nil {
-			return
-		}
-	}
-
-	err = p.addProxy(proxyC)
-	return
-}
-
-func (p *Pool) getNextProxy(r *http.Request) (proxyC *proxyContainer, err error) {
+func (p *Pool) getNextProxy(r *http.Request) (proxy *Proxy, err error) {
 	err = p.sem.Acquire(r.Context(), 1)
 	if err != nil {
 		return
@@ -118,13 +71,13 @@ func (p *Pool) getNextProxy(r *http.Request) (proxyC *proxyContainer, err error)
 
 	p.sem.Release(1)
 
-	proxyC, ok = current.Value.(*proxyContainer)
+	proxy, ok = current.Value.(*Proxy)
 	if !ok {
 		err = errors.New("bad type")
 		return
 	}
 
-	if !proxyC.canServe(r) {
+	if !proxy.canServe(r) {
 		err = errors.New("unable to serve this request")
 		return
 	}
@@ -141,12 +94,12 @@ func (p *Pool) getConn(r *http.Request) (conn net.Conn, err error) {
 				return
 			}
 
-			proxyC, err := p.getNextProxy(r)
+			proxy, err := p.getNextProxy(r)
 			if err != nil {
 				continue
 			}
 
-			conn, err := proxyC.proxy.Connection(r.URL)
+			conn, err := proxy.Connection(r.URL)
 			if err != nil {
 				continue
 			}
@@ -175,6 +128,7 @@ func (p *Pool) Serve(w http.ResponseWriter, r *http.Request) {
 	pConn, err := p.getConn(r)
 	if err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
+		log.Println(err)
 		return
 	}
 
@@ -196,11 +150,12 @@ func (p *Pool) Serve(w http.ResponseWriter, r *http.Request) {
 	go transfer(cConn, pConn)
 }
 
+//Proxy is used to distribute client side requests when using an http.Client
 func (p *Pool) Proxy(r *http.Request) (*url.URL, error) {
-	pc, err := p.getNextProxy(r)
+	proxy, err := p.getNextProxy(r)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %v", err)
 	}
 
-	return pc.proxy.URL, nil
+	return proxy.URL, nil
 }

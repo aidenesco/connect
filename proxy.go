@@ -9,12 +9,17 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/thinkgos/go-socks5/ccsocks5"
+	"golang.org/x/sync/semaphore"
 )
 
 type Proxy struct {
-	URL *url.URL
+	URL            *url.URL
+	betweenUse     time.Duration
+	lastUsePerHost map[string]time.Time
+	sem            *semaphore.Weighted
 }
 
 func (p *Proxy) Connection(to *url.URL) (conn net.Conn, err error) {
@@ -37,11 +42,17 @@ func (p *Proxy) Connection(to *url.URL) (conn net.Conn, err error) {
 			return
 		}
 
-		connect := &http.Request{
-			Method: http.MethodConnect,
-			URL:    &url.URL{Opaque: to.Host},
-			Host:   to.Host,
-			Header: make(http.Header),
+		// connect := &http.Request{
+		// 	Method: http.MethodConnect,
+		// 	URL:    &url.URL{Opaque: to.Host},
+		// 	Host:   to.Host,
+		// 	Header: make(http.Header),
+		// }
+
+		var connect *http.Request
+		connect, err = http.NewRequest(http.MethodConnect, to.String(), nil)
+		if err != nil {
+			return
 		}
 
 		if u := p.URL.User; u != nil {
@@ -84,4 +95,41 @@ func (p *Proxy) Connection(to *url.URL) (conn net.Conn, err error) {
 		return
 	}
 
+}
+
+func (p *Proxy) canServe(r *http.Request) bool {
+	err := p.sem.Acquire(r.Context(), 1)
+	if err != nil {
+		return false
+	}
+
+	if p.betweenUse != 0 {
+		prev, ok := p.lastUsePerHost[r.Host]
+		if ok && time.Since(prev) <= p.betweenUse {
+			p.sem.Release(1)
+			return false
+		}
+	}
+
+	p.lastUsePerHost[r.Host] = time.Now()
+
+	p.sem.Release(1)
+	return true
+}
+
+func NewProxy(u *url.URL, o ...ProxyOption) (p *Proxy, err error) {
+	p = &Proxy{
+		URL:            u,
+		lastUsePerHost: make(map[string]time.Time),
+		sem:            semaphore.NewWeighted(1),
+	}
+
+	for _, opt := range o {
+		err = opt(p)
+		if err != nil {
+			return
+		}
+	}
+
+	return
 }
